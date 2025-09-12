@@ -5,6 +5,13 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const mysql = require('mysql2');
+const { 
+  generateOTP, 
+  generateResetToken, 
+  sendOTPEmail, 
+  sendVerificationEmail, 
+  sendPasswordResetEmail 
+} = require('./services/emailService');
 require('dotenv').config();
 
 const app = express();
@@ -47,12 +54,35 @@ const authenticateToken = (req, res, next) => {
 };
 
 // Health check endpoint
-app.get('/api/health', (req, res) => {
-  res.json({
-    message: 'Hugli Printing Press API is running',
-    timestamp: new Date().toISOString(),
-    status: 'healthy'
-  });
+app.get('/api/health', async (req, res) => {
+  try {
+    // Test database connection
+    const connection = await pool.getConnection();
+    const [versionRows] = await connection.execute('SELECT VERSION() as version');
+    const [tableRows] = await connection.execute('SHOW TABLES');
+    connection.release();
+    
+    res.json({
+      message: 'Hugli Printing Press API is running',
+      timestamp: new Date().toISOString(),
+      status: 'healthy',
+      database: {
+        connected: true,
+        version: versionRows[0].version,
+        tables: tableRows.length
+      }
+    });
+  } catch (error) {
+    res.status(503).json({
+      message: 'Database connection failed',
+      timestamp: new Date().toISOString(),
+      status: 'unhealthy',
+      database: {
+        connected: false,
+        error: error.message
+      }
+    });
+  }
 });
 
 // ==================== AUTHENTICATION ENDPOINTS ====================
@@ -77,35 +107,42 @@ app.post('/api/auth/register', async (req, res) => {
     const saltRounds = 10;
     const hashedPassword = await bcrypt.hash(password, saltRounds);
 
-    // Insert new user
+    // Insert new user (pending verification)
     const [result] = await pool.execute(
-      'INSERT INTO users (name, email, password, phone, company, status, role) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      [name, email, hashedPassword, phone || null, company || null, 'active', 'customer']
+      'INSERT INTO users (name, email, password, phone, company, status, role, email_verified) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      [name, email, hashedPassword, phone || null, company || null, 'pending', 'user', false]
     );
 
-    // Generate JWT token
-    const token = jwt.sign(
-      { 
-        userId: result.insertId, 
-        email: email, 
-        name: name,
-        role: 'customer'
-      },
-      JWT_SECRET,
-      { expiresIn: '7d' }
+    // Generate OTP for email verification
+    const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Store OTP for email verification
+    await pool.execute(
+      'INSERT INTO otp_codes (email, otp_code, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [email, otp, 'email_verification', expiresAt]
     );
+
+    // Send OTP email for verification
+    const emailResult = await sendOTPEmail(email, otp);
+    if (!emailResult.success) {
+      console.error('❌ Failed to send OTP email:', emailResult.error);
+      // Still return success but warn user
+    }
 
     console.log('✅ User registered successfully:', email);
     res.status(201).json({
-      message: 'User registered successfully',
-      token,
+      message: 'User registered successfully. Please check your email for the OTP to verify your account.',
+      requiresVerification: true,
+      verificationType: 'otp',
       user: {
         id: result.insertId,
         name,
         email,
         phone: phone || null,
         company: company || null,
-        role: 'customer'
+        role: 'user',
+        email_verified: false
       }
     });
   } catch (error) {
@@ -137,6 +174,15 @@ app.post('/api/auth/login', async (req, res) => {
     if (user.status !== 'active') {
       console.log('❌ Inactive user:', email);
       return res.status(401).json({ message: 'Account is inactive' });
+    }
+
+    // Check if email is verified
+    if (!user.email_verified) {
+      console.log('❌ Unverified email:', email);
+      return res.status(401).json({ 
+        message: 'Please verify your email before logging in',
+        requiresVerification: true 
+      });
     }
 
     // Verify password
@@ -190,6 +236,363 @@ app.get('/api/auth/profile', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('❌ Profile fetch error:', error);
     res.status(500).json({ message: 'Error fetching user profile' });
+  }
+});
+
+// ==================== EMAIL AUTHENTICATION ENDPOINTS ====================
+
+// Send OTP for login
+app.post('/api/auth/send-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if user exists
+    const [users] = await pool.execute('SELECT id, name FROM users WHERE email = ?', [email]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    // Generate and store OTP
+    const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Delete any existing OTPs for this email
+    await pool.execute('DELETE FROM otp_codes WHERE email = ? AND purpose = ?', [email, 'login']);
+
+    // Store new OTP
+    await pool.execute(
+      'INSERT INTO otp_codes (email, otp_code, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [email, otp, 'login', expiresAt]
+    );
+
+    // Send OTP email
+    const emailResult = await sendOTPEmail(email, otp);
+    if (!emailResult.success) {
+      return res.status(500).json({ message: 'Failed to send OTP email' });
+    }
+
+    console.log('✅ OTP sent successfully:', email);
+    res.json({ message: 'OTP sent successfully' });
+  } catch (error) {
+    console.error('❌ Send OTP error:', error);
+    res.status(500).json({ message: 'Error sending OTP' });
+  }
+});
+
+// Verify OTP and login
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+
+    // Find valid OTP
+    const [otpRecords] = await pool.execute(
+      'SELECT * FROM otp_codes WHERE email = ? AND otp_code = ? AND purpose = ? AND used = FALSE AND expires_at > NOW()',
+      [email, otp, 'login']
+    );
+
+    if (otpRecords.length === 0) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    // Mark OTP as used
+    await pool.execute('UPDATE otp_codes SET used = TRUE WHERE id = ?', [otpRecords[0].id]);
+
+    // Get user details
+    const [users] = await pool.execute('SELECT * FROM users WHERE email = ?', [email]);
+    const user = users[0];
+
+    // Generate JWT token
+    const token = jwt.sign(
+      { 
+        userId: user.id, 
+        email: user.email, 
+        name: user.name,
+        role: user.role
+      },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    console.log('✅ OTP verified and login successful:', email);
+    res.json({
+      message: 'Login successful',
+      token,
+      user: {
+        id: user.id,
+        name: user.name,
+        email: user.email,
+        phone: user.phone,
+        company: user.company,
+        role: user.role
+      }
+    });
+  } catch (error) {
+    console.error('❌ Verify OTP error:', error);
+    res.status(500).json({ message: 'Error verifying OTP' });
+  }
+});
+
+// Verify OTP for email verification (signup)
+app.post('/api/auth/verify-email-otp', async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    
+    if (!email || !otp) {
+      return res.status(400).json({ message: 'Email and OTP are required' });
+    }
+
+    // Find valid OTP for email verification
+    const [otpRecords] = await pool.execute(
+      'SELECT * FROM otp_codes WHERE email = ? AND otp_code = ? AND purpose = ? AND used = FALSE AND expires_at > NOW()',
+      [email, otp, 'email_verification']
+    );
+
+    if (otpRecords.length === 0) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    // Mark OTP as used
+    await pool.execute('UPDATE otp_codes SET used = TRUE WHERE id = ?', [otpRecords[0].id]);
+
+    // Update user as verified and active
+    await pool.execute('UPDATE users SET email_verified = TRUE, status = ? WHERE email = ?', ['active', email]);
+
+    console.log('✅ Email verified successfully:', email);
+    res.json({
+      message: 'Email verified successfully! You can now login to your account.',
+      success: true
+    });
+  } catch (error) {
+    console.error('❌ Verify email OTP error:', error);
+    res.status(500).json({ message: 'Error verifying email OTP' });
+  }
+});
+
+// Send email verification for signup
+app.post('/api/auth/send-verification', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if user exists and is not verified
+    const [users] = await pool.execute('SELECT id, name, email_verified FROM users WHERE email = ?', [email]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = users[0];
+    if (user.email_verified) {
+      return res.status(400).json({ message: 'Email already verified' });
+    }
+
+    // Generate verification token
+    const verificationToken = generateResetToken();
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24 hours
+
+    // Delete any existing verification tokens
+    await pool.execute('DELETE FROM email_verifications WHERE user_id = ?', [user.id]);
+
+    // Store verification token
+    await pool.execute(
+      'INSERT INTO email_verifications (user_id, email, verification_token, expires_at) VALUES (?, ?, ?, ?)',
+      [user.id, email, verificationToken, expiresAt]
+    );
+
+    // Send verification email
+    const emailResult = await sendVerificationEmail(email, verificationToken);
+    if (!emailResult.success) {
+      return res.status(500).json({ message: 'Failed to send verification email' });
+    }
+
+    console.log('✅ Verification email sent successfully:', email);
+    res.json({ message: 'Verification email sent successfully' });
+  } catch (error) {
+    console.error('❌ Send verification error:', error);
+    res.status(500).json({ message: 'Error sending verification email' });
+  }
+});
+
+// Verify email
+app.get('/api/auth/verify-email', async (req, res) => {
+  try {
+    const { token } = req.query;
+    
+    if (!token) {
+      return res.status(400).json({ message: 'Verification token is required' });
+    }
+
+    // Find valid verification token
+    const [verificationRecords] = await pool.execute(
+      'SELECT * FROM email_verifications WHERE verification_token = ? AND verified = FALSE AND expires_at > NOW()',
+      [token]
+    );
+
+    if (verificationRecords.length === 0) {
+      return res.status(400).json({ message: 'Invalid or expired verification token' });
+    }
+
+    const verification = verificationRecords[0];
+
+    // Mark email as verified
+    await pool.execute('UPDATE users SET email_verified = TRUE, status = ? WHERE id = ?', ['active', verification.user_id]);
+    await pool.execute('UPDATE email_verifications SET verified = TRUE WHERE id = ?', [verification.id]);
+
+    console.log('✅ Email verified successfully:', verification.email);
+    res.json({ message: 'Email verified successfully' });
+  } catch (error) {
+    console.error('❌ Verify email error:', error);
+    res.status(500).json({ message: 'Error verifying email' });
+  }
+});
+
+// Resend email verification OTP
+app.post('/api/auth/resend-verification-otp', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if user exists and is not verified
+    const [users] = await pool.execute('SELECT id, name, email_verified FROM users WHERE email = ?', [email]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = users[0];
+    if (user.email_verified) {
+      return res.status(400).json({ message: 'Email already verified' });
+    }
+
+    // Generate new OTP for email verification
+    const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Delete any existing OTPs for email verification
+    await pool.execute('DELETE FROM otp_codes WHERE email = ? AND purpose = ?', [email, 'email_verification']);
+
+    // Store new OTP
+    await pool.execute(
+      'INSERT INTO otp_codes (email, otp_code, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [email, otp, 'email_verification', expiresAt]
+    );
+
+    // Send OTP email
+    const emailResult = await sendOTPEmail(email, otp);
+    if (!emailResult.success) {
+      return res.status(500).json({ message: 'Failed to send OTP email' });
+    }
+
+    console.log('✅ Email verification OTP resent successfully:', email);
+    res.json({ message: 'OTP sent successfully' });
+  } catch (error) {
+    console.error('❌ Resend verification OTP error:', error);
+    res.status(500).json({ message: 'Error sending OTP' });
+  }
+});
+
+// Send password reset email
+app.post('/api/auth/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    
+    if (!email) {
+      return res.status(400).json({ message: 'Email is required' });
+    }
+
+    // Check if user exists
+    const [users] = await pool.execute('SELECT id, name FROM users WHERE email = ?', [email]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const user = users[0];
+
+    // Generate OTP for password reset
+    const otp = generateOTP();
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+    // Delete any existing OTP codes for password reset
+    await pool.execute('DELETE FROM otp_codes WHERE email = ? AND purpose = ?', [email, 'password_reset']);
+
+    // Store OTP for password reset
+    await pool.execute(
+      'INSERT INTO otp_codes (email, otp_code, purpose, expires_at) VALUES (?, ?, ?, ?)',
+      [email, otp, 'password_reset', expiresAt]
+    );
+
+    // Send OTP email for password reset
+    const emailResult = await sendOTPEmail(email, otp);
+    if (!emailResult.success) {
+      return res.status(500).json({ message: 'Failed to send password reset OTP' });
+    }
+
+    console.log('✅ Password reset OTP sent successfully:', email);
+    res.json({ 
+      message: 'Password reset OTP sent successfully. Please check your email.',
+      requiresOTP: true,
+      email: email
+    });
+  } catch (error) {
+    console.error('❌ Forgot password error:', error);
+    res.status(500).json({ message: 'Error sending password reset OTP' });
+  }
+});
+
+// Reset password with OTP
+app.post('/api/auth/reset-password', async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    
+    if (!email || !otp || !newPassword) {
+      return res.status(400).json({ message: 'Email, OTP, and new password are required' });
+    }
+
+    // Find valid OTP for password reset
+    const [otpRecords] = await pool.execute(
+      'SELECT * FROM otp_codes WHERE email = ? AND otp_code = ? AND purpose = ? AND used = FALSE AND expires_at > NOW()',
+      [email, otp, 'password_reset']
+    );
+
+    if (otpRecords.length === 0) {
+      return res.status(400).json({ message: 'Invalid or expired OTP' });
+    }
+
+    const otpRecord = otpRecords[0];
+
+    // Get user ID
+    const [users] = await pool.execute('SELECT id FROM users WHERE email = ?', [email]);
+    if (users.length === 0) {
+      return res.status(404).json({ message: 'User not found' });
+    }
+
+    const userId = users[0].id;
+
+    // Hash new password
+    const saltRounds = 10;
+    const hashedPassword = await bcrypt.hash(newPassword, saltRounds);
+
+    // Update password and mark OTP as used
+    await pool.execute('UPDATE users SET password = ? WHERE id = ?', [hashedPassword, userId]);
+    await pool.execute('UPDATE otp_codes SET used = TRUE WHERE id = ?', [otpRecord.id]);
+
+    console.log('✅ Password reset successfully for user:', userId);
+    res.json({ message: 'Password reset successfully' });
+  } catch (error) {
+    console.error('❌ Reset password error:', error);
+    res.status(500).json({ message: 'Error resetting password' });
   }
 });
 
@@ -928,11 +1331,73 @@ app.use((error, req, res, next) => {
 
 
 
+// Database connection test function
+async function testDatabaseConnection() {
+  try {
+    console.log('🔍 Testing database connection...');
+    console.log(`📡 Database Host: ${process.env.DB_HOST || 'localhost'}`);
+    console.log(`👤 Database User: ${process.env.DB_USER || 'root'}`);
+    console.log(`🗄️  Database Name: ${process.env.DB_NAME || 'hugly_printing_db'}`);
+    console.log(`🔌 Database Port: ${process.env.DB_PORT || 3306}`);
+    console.log('');
+    
+    // Test basic connection
+    const connection = await pool.getConnection();
+    console.log('✅ Database connection successful');
+    
+    // Get database info
+    const [versionRows] = await connection.execute('SELECT VERSION() as version');
+    const [tableRows] = await connection.execute('SHOW TABLES');
+    
+    console.log(`📊 MySQL Version: ${versionRows[0].version}`);
+    console.log(`📋 Tables found: ${tableRows.length}`);
+    
+    // List important tables
+    const importantTables = ['users', 'orders', 'order_items', 'contact_messages', 'otp_codes'];
+    const existingTables = tableRows.map(row => Object.values(row)[0]);
+    
+    console.log('🔍 Important tables status:');
+    importantTables.forEach(tableName => {
+      const status = existingTables.includes(tableName) ? '✅' : '❌';
+      console.log(`   ${status} ${tableName}`);
+    });
+    
+    connection.release();
+    return true;
+  } catch (error) {
+    console.error('❌ Database connection failed!');
+    console.error(`   Host: ${process.env.DB_HOST || 'localhost'}`);
+    console.error(`   User: ${process.env.DB_USER || 'root'}`);
+    console.error(`   Database: ${process.env.DB_NAME || 'hugly_printing_db'}`);
+    console.error(`   Port: ${process.env.DB_PORT || 3306}`);
+    console.error(`   Error: ${error.message}`);
+    console.error(`   Code: ${error.code}`);
+    console.log('');
+    console.log('🔧 Troubleshooting:');
+    console.log('   1. Check if MySQL server is running');
+    console.log('   2. Verify database credentials in .env file');
+    console.log('   3. Ensure database exists');
+    console.log('   4. Check MySQL user permissions');
+    return false;
+  }
+}
+
 // Start server
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log('🚀 Hugli Printing Press Server Started!');
   console.log(`🌐 Server running on port ${PORT}`);
-  console.log('✅ Ready to handle all requests');
+  console.log('='.repeat(50));
+  
+  // Test database connection
+  const dbConnected = await testDatabaseConnection();
+  console.log('='.repeat(50));
+  
+  if (dbConnected) {
+    console.log('✅ Ready to handle all requests');
+  } else {
+    console.log('⚠️  Server started but database connection failed');
+    console.log('   Some features may not work properly');
+  }
   console.log('📋 Available endpoints:');
   console.log('  - GET  /api/health');
   console.log('  - POST /api/auth/register');
