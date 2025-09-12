@@ -10,7 +10,8 @@ const {
   generateResetToken, 
   sendOTPEmail, 
   sendVerificationEmail, 
-  sendPasswordResetEmail 
+  sendPasswordResetEmail,
+  verifyEmailConnection
 } = require('./services/emailService');
 require('dotenv').config();
 
@@ -1392,10 +1393,17 @@ app.listen(PORT, async () => {
   const dbConnected = await testDatabaseConnection();
   console.log('='.repeat(50));
   
-  if (dbConnected) {
+  // Test email service connection
+  const emailConnected = await verifyEmailConnection();
+  console.log('='.repeat(50));
+  
+  if (dbConnected && emailConnected) {
     console.log('✅ Ready to handle all requests');
+    console.log('🎉 All services (Database + Email) are operational');
   } else {
-    console.log('⚠️  Server started but database connection failed');
+    console.log('⚠️  Server started but some services failed:');
+    if (!dbConnected) console.log('   ❌ Database connection failed');
+    if (!emailConnected) console.log('   ❌ Email service connection failed');
     console.log('   Some features may not work properly');
   }
   console.log('📋 Available endpoints:');

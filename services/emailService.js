@@ -1,17 +1,48 @@
 const nodemailer = require('nodemailer');
 const crypto = require('crypto');
 
-// Gmail SMTP configuration
+// Gmail SMTP configuration with Railway hosting optimizations
 const emailConfig = {
   service: 'gmail',
+  host: 'smtp.gmail.com',
+  port: 587,
+  secure: false, // true for 465, false for other ports
   auth: {
-    user: 'amankachura2975@gmail.com',
-    pass: 'ilsk pond lszj xjsi'
-  }
+    user: process.env.GMAIL_USER || 'amankachura2975@gmail.com',
+    pass: process.env.GMAIL_APP_PASSWORD || 'ilsk pond lszj xjsi'
+  },
+  // Railway hosting optimizations
+  connectionTimeout: 60000, // 60 seconds
+  greetingTimeout: 30000,   // 30 seconds
+  socketTimeout: 60000,     // 60 seconds
+  pool: true,
+  maxConnections: 5,
+  maxMessages: 100,
+  rateDelta: 20000, // 20 seconds
+  rateLimit: 5, // max 5 messages per rateDelta
+  // Retry configuration
+  retryDelay: 5000, // 5 seconds
+  retryAttempts: 3,
+  // Debug mode for Railway
+  debug: process.env.NODE_ENV === 'development',
+  logger: process.env.NODE_ENV === 'development'
 };
 
 // Create transporter
 const transporter = nodemailer.createTransport(emailConfig);
+
+// Verify email connection
+const verifyEmailConnection = async () => {
+  try {
+    console.log('🔍 Verifying email service connection...');
+    await transporter.verify();
+    console.log('✅ Email service connection verified successfully');
+    return true;
+  } catch (error) {
+    console.error('❌ Email service connection failed:', error.message);
+    return false;
+  }
+};
 
 // Generate 6-digit OTP
 const generateOTP = () => {
@@ -23,13 +54,15 @@ const generateResetToken = () => {
   return crypto.randomBytes(32).toString('hex');
 };
 
-// Send OTP for login verification
-const sendOTPEmail = async (email, otp) => {
+// Send OTP for login verification with retry logic
+const sendOTPEmail = async (email, otp, retryCount = 0) => {
   try {
+    console.log(`📧 Sending OTP email to ${email} (attempt ${retryCount + 1})`);
+    
     const mailOptions = {
       from: {
         name: 'Hugli Printing Service',
-        address: 'amankachura2975@gmail.com'
+        address: process.env.GMAIL_USER || 'amankachura2975@gmail.com'
       },
       to: email,
       subject: 'Your hugli account Login Verification Code',
@@ -51,20 +84,30 @@ const sendOTPEmail = async (email, otp) => {
     console.log('✅ OTP email sent successfully:', email);
     return { success: true, messageId: result.messageId };
   } catch (error) {
-    console.error('❌ Error sending OTP email:', error);
+    console.error(`❌ Error sending OTP email (attempt ${retryCount + 1}):`, error.message);
+    
+    // Retry logic for Railway hosting
+    if (retryCount < 2 && (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET' || error.message.includes('timeout'))) {
+      console.log(`🔄 Retrying OTP email in 5 seconds... (attempt ${retryCount + 2})`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return sendOTPEmail(email, otp, retryCount + 1);
+    }
+    
     return { success: false, error: error.message };
   }
 };
 
-// Send email verification for signup
-const sendVerificationEmail = async (email, verificationToken) => {
+// Send email verification for signup with retry logic
+const sendVerificationEmail = async (email, verificationToken, retryCount = 0) => {
   try {
+    console.log(`📧 Sending verification email to ${email} (attempt ${retryCount + 1})`);
+    
     const verificationUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/verify-email?token=${verificationToken}`;
     
     const mailOptions = {
       from: {
         name: 'Hugli Printing Service',
-        address: 'amankachura2975@gmail.com'
+        address: process.env.GMAIL_USER || 'amankachura2975@gmail.com'
       },
       to: email,
       subject: 'Verify Your Hugli Account',
@@ -92,20 +135,30 @@ const sendVerificationEmail = async (email, verificationToken) => {
     console.log('✅ Verification email sent successfully:', email);
     return { success: true, messageId: result.messageId };
   } catch (error) {
-    console.error('❌ Error sending verification email:', error);
+    console.error(`❌ Error sending verification email (attempt ${retryCount + 1}):`, error.message);
+    
+    // Retry logic for Railway hosting
+    if (retryCount < 2 && (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET' || error.message.includes('timeout'))) {
+      console.log(`🔄 Retrying verification email in 5 seconds... (attempt ${retryCount + 2})`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return sendVerificationEmail(email, verificationToken, retryCount + 1);
+    }
+    
     return { success: false, error: error.message };
   }
 };
 
-// Send password reset email
-const sendPasswordResetEmail = async (email, resetToken) => {
+// Send password reset email with retry logic
+const sendPasswordResetEmail = async (email, resetToken, retryCount = 0) => {
   try {
+    console.log(`📧 Sending password reset email to ${email} (attempt ${retryCount + 1})`);
+    
     const resetUrl = `${process.env.FRONTEND_URL || 'http://localhost:3000'}/reset-password?token=${resetToken}`;
     
     const mailOptions = {
       from: {
         name: 'Hugli Printing Service',
-        address: 'amankachura2975@gmail.com'
+        address: process.env.GMAIL_USER || 'amankachura2975@gmail.com'
       },
       to: email,
       subject: 'Reset Your Hugli Account Password',
@@ -134,7 +187,15 @@ const sendPasswordResetEmail = async (email, resetToken) => {
     console.log('✅ Password reset email sent successfully:', email);
     return { success: true, messageId: result.messageId };
   } catch (error) {
-    console.error('❌ Error sending password reset email:', error);
+    console.error(`❌ Error sending password reset email (attempt ${retryCount + 1}):`, error.message);
+    
+    // Retry logic for Railway hosting
+    if (retryCount < 2 && (error.code === 'ETIMEDOUT' || error.code === 'ECONNRESET' || error.message.includes('timeout'))) {
+      console.log(`🔄 Retrying password reset email in 5 seconds... (attempt ${retryCount + 2})`);
+      await new Promise(resolve => setTimeout(resolve, 5000));
+      return sendPasswordResetEmail(email, resetToken, retryCount + 1);
+    }
+    
     return { success: false, error: error.message };
   }
 };
@@ -144,5 +205,6 @@ module.exports = {
   generateResetToken,
   sendOTPEmail,
   sendVerificationEmail,
-  sendPasswordResetEmail
+  sendPasswordResetEmail,
+  verifyEmailConnection
 };
